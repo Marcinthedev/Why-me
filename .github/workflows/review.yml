@@ -1,0 +1,134 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr_diff.txt
+          echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
+
+      - name: Run Claude Review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys
+
+          with open('/tmp/pr_diff.txt', 'r') as f:
+              diff = f.read()[:15000]
+
+          prompt = (
+              "Zrob code review ponizszego diff. "
+              "Skup sie na: bledach, problemach z typami, bezpieczenstwie, wydajnosci i czystosci kodu.\n\n"
+              "Na koncu odpowiedzi dodaj JEDNA linie:\n"
+              "VERDICT APPROVE - jesli kod jest dobry\n"
+              "VERDICT REQUEST_CHANGES - jesli sa bledy lub istotne uwagi\n\n"
+              "Odpowiedz po polsku.\n\n"
+              f"```diff\n{diff}\n```"
+          )
+
+          payload = json.dumps({
+              "model": "claude-haiku-4-5-20251001",
+              "max_tokens": 1024,
+              "messages": [{"role": "user", "content": prompt}]
+          })
+
+          result = subprocess.run(
+              ["curl", "-s", "-w", "\n%{http_code}",
+               "https://api.anthropic.com/v1/messages",
+               "-H", f"x-api-key: {os.environ['ANTHROPIC_API_KEY']}",
+               "-H", "anthropic-version: 2023-06-01",
+               "-H", "content-type: application/json",
+               "-d", payload],
+              capture_output=True, text=True
+          )
+
+          lines = result.stdout.strip().split('\n')
+          http_code = lines[-1]
+          body = '\n'.join(lines[:-1])
+
+          print(f"HTTP Status: {http_code}")
+          print(f"Response: {body}")
+
+          if http_code != "200":
+              try:
+                  err = json.loads(body).get("error", {}).get("message", "unknown")
+              except Exception:
+                  err = body
+              review = f"Claude API error (HTTP {http_code}): {err}"
+              verdict = "COMMENT"
+          else:
+              data = json.loads(body)
+              text = data["content"][0]["text"]
+
+              verdict = "COMMENT"
+              if "VERDICT APPROVE" in text:
+                  verdict = "APPROVE"
+              elif "VERDICT REQUEST_CHANGES" in text:
+                  verdict = "REQUEST_CHANGES"
+
+              review = "\n".join([l for l in text.split("\n") if not l.startswith("VERDICT")])
+
+          env_file = os.environ["GITHUB_ENV"]
+          with open(env_file, "a") as f:
+              f.write(f"VERDICT={verdict}\n")
+              f.write("REVIEW<<EOF\n")
+              f.write(review.strip())
+              f.write("\nEOF\n")
+
+          PYEOF
+
+      - name: Dismiss stale reviews on new push
+        if: github.event.action == 'synchronize'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.BOT_GH_TOKEN }}
+          script: |
+            const reviews = await github.rest.pulls.listReviews({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+            for (const review of reviews.data) {
+              if (review.state === 'CHANGES_REQUESTED') {
+                await github.rest.pulls.dismissReview({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: context.issue.number,
+                  review_id: review.id,
+                  message: 'Nowy commit - ponowna analiza.'
+                });
+              }
+            }
+
+      - name: Post review as bot
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.BOT_GH_TOKEN }}
+          script: |
+            const review = process.env.REVIEW;
+            const verdict = process.env.VERDICT;
+            const emoji = { APPROVE: '✅', REQUEST_CHANGES: '❌', COMMENT: '💬' };
+
+            await github.rest.pulls.createReview({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              event: verdict,
+              body: `## ${emoji[verdict] || '💬'} Claude Code Review\n\n${review}`
+            });
