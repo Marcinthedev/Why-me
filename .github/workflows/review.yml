@@ -28,22 +28,57 @@ jobs:
         run: |
           DIFF=$(cat pr_diff.txt | head -c 15000)
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          # Escape diff for JSON
+          DIFF_ESCAPED=$(echo "$DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+
+          PAYLOAD=$(python3 -c "
+          import json
+          diff = $DIFF_ESCAPED
+          payload = {
+            'model': 'claude-haiku-4-5-20251001',
+            'max_tokens': 1024,
+            'messages': [{
+              'role': 'user',
+              'content': f'''Zrób code review poniższego diff. Skup się na: błędach, problemach z typami, bezpieczeństwie, wydajności i czystości kodu.
+
+Na końcu odpowiedzi dodaj JEDNĄ linię:
+VERDICT: APPROVE lub VERDICT: REQUEST_CHANGES
+
+APPROVE jeśli kod jest dobry i nie ma poważnych problemów.
+REQUEST_CHANGES jeśli są błędy lub istotne uwagi.
+
+Odpowiedz po polsku.
+
+\`\`\`diff
+{diff}
+\`\`\`'''
+            }]
+          }
+          print(json.dumps(payload))
+          ")
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -H "content-type: application/json" \
-            -d "{
-              \"model\": \"claude-haiku-4-5-20251001\",
-              \"max_tokens\": 1024,
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"Zrób code review poniższego diff. Skup się na: błędach, problemach z typami, bezpieczeństwie, wydajności i czystości kodu.\n\nNa końcu odpowiedzi dodaj JEDNĄ linię w formacie:\nVERDICT: APPROVE lub VERDICT: REQUEST_CHANGES\n\nAPPROVE tylko jeśli kod jest dobry i nie ma poważnych problemów.\nREQUEST_CHANGES jeśli są błędy lub istotne uwagi.\n\nOdpowiedz po polsku.\n\n\`\`\`diff\n$DIFF\n\`\`\`\"
-              }]
-            }")
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "REVIEW=❌ Claude API error (HTTP $HTTP_CODE): $(echo $BODY | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"error\", {}).get(\"message\", \"unknown error\"))')" >> $GITHUB_ENV
+            echo "VERDICT=COMMENT" >> $GITHUB_ENV
+            exit 0
+          fi
 
           python3 -c "
           import sys, json, os
-          data = json.load(sys.stdin)
+
+          data = json.loads('$BODY' if False else open('/dev/stdin').read())
           text = data['content'][0]['text']
 
           verdict = 'COMMENT'
@@ -59,7 +94,7 @@ jobs:
               f.write('REVIEW<<EOF\n')
               f.write(review.strip())
               f.write('\nEOF\n')
-          " <<< "$RESPONSE"
+          " <<< "$BODY"
 
       - name: Dismiss stale review on new push
         if: github.event.action == 'synchronize'
