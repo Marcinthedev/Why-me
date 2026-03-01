@@ -97,7 +97,7 @@ jobs:
         if: github.event.action == 'synchronize'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.BOT_GITHUB_TOKEN }}
+          github-token: ${{ secrets.BOT_GH_TOKEN }}
           script: |
             const reviews = await github.rest.pulls.listReviews({
               owner: context.repo.owner,
@@ -119,7 +119,7 @@ jobs:
       - name: Post review as bot
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.BOT_GITHUB_TOKEN }}
+          github-token: ${{ secrets.BOT_GH_TOKEN }}
           script: |
             const review = process.env.REVIEW;
             const verdict = process.env.VERDICT;
