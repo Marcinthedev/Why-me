@@ -19,84 +19,81 @@ jobs:
 
       - name: Get PR diff
         run: |
-          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
-          echo "Diff size: $(wc -c < pr_diff.txt) bytes"
+          git diff origin/${{ github.base_ref }}...HEAD > /tmp/pr_diff.txt
+          echo "Diff size: $(wc -c < /tmp/pr_diff.txt) bytes"
 
       - name: Run Claude Review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          DIFF=$(cat pr_diff.txt | head -c 15000)
+          python3 << 'PYEOF'
+          import json, os, subprocess, sys
 
-          # Escape diff for JSON
-          DIFF_ESCAPED=$(echo "$DIFF" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          with open('/tmp/pr_diff.txt', 'r') as f:
+              diff = f.read()[:15000]
 
-          PAYLOAD=$(python3 -c "
-          import json
-          diff = $DIFF_ESCAPED
-          payload = {
-            'model': 'claude-haiku-4-5-20251001',
-            'max_tokens': 1024,
-            'messages': [{
-              'role': 'user',
-              'content': f'''Zrób code review poniższego diff. Skup się na: błędach, problemach z typami, bezpieczeństwie, wydajności i czystości kodu.
+          prompt = (
+              "Zrob code review ponizszego diff. "
+              "Skup sie na: bledach, problemach z typami, bezpieczenstwie, wydajnosci i czystosci kodu.\n\n"
+              "Na koncu odpowiedzi dodaj JEDNA linie:\n"
+              "VERDICT APPROVE - jesli kod jest dobry\n"
+              "VERDICT REQUEST_CHANGES - jesli sa bledy lub istotne uwagi\n\n"
+              "Odpowiedz po polsku.\n\n"
+              f"```diff\n{diff}\n```"
+          )
 
-Na końcu odpowiedzi dodaj JEDNĄ linię:
-VERDICT: APPROVE lub VERDICT: REQUEST_CHANGES
+          payload = json.dumps({
+              "model": "claude-haiku-4-5-20251001",
+              "max_tokens": 1024,
+              "messages": [{"role": "user", "content": prompt}]
+          })
 
-APPROVE jeśli kod jest dobry i nie ma poważnych problemów.
-REQUEST_CHANGES jeśli są błędy lub istotne uwagi.
+          result = subprocess.run(
+              ["curl", "-s", "-w", "\n%{http_code}",
+               "https://api.anthropic.com/v1/messages",
+               "-H", f"x-api-key: {os.environ['ANTHROPIC_API_KEY']}",
+               "-H", "anthropic-version: 2023-06-01",
+               "-H", "content-type: application/json",
+               "-d", payload],
+              capture_output=True, text=True
+          )
 
-Odpowiedz po polsku.
+          lines = result.stdout.strip().split('\n')
+          http_code = lines[-1]
+          body = '\n'.join(lines[:-1])
 
-\`\`\`diff
-{diff}
-\`\`\`'''
-            }]
-          }
-          print(json.dumps(payload))
-          ")
+          print(f"HTTP Status: {http_code}")
+          print(f"Response: {body}")
 
-          RESPONSE=$(curl -s -w "\n%{http_code}" https://api.anthropic.com/v1/messages \
-            -H "x-api-key: $ANTHROPIC_API_KEY" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$PAYLOAD")
+          if http_code != "200":
+              try:
+                  err = json.loads(body).get("error", {}).get("message", "unknown")
+              except Exception:
+                  err = body
+              review = f"Claude API error (HTTP {http_code}): {err}"
+              verdict = "COMMENT"
+          else:
+              data = json.loads(body)
+              text = data["content"][0]["text"]
 
-          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-          BODY=$(echo "$RESPONSE" | head -n -1)
+              verdict = "COMMENT"
+              if "VERDICT APPROVE" in text:
+                  verdict = "APPROVE"
+              elif "VERDICT REQUEST_CHANGES" in text:
+                  verdict = "REQUEST_CHANGES"
 
-          echo "HTTP Status: $HTTP_CODE"
-          echo "Response: $BODY"
+              review = "\n".join([l for l in text.split("\n") if not l.startswith("VERDICT")])
 
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "REVIEW=❌ Claude API error (HTTP $HTTP_CODE): $(echo $BODY | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"error\", {}).get(\"message\", \"unknown error\"))')" >> $GITHUB_ENV
-            echo "VERDICT=COMMENT" >> $GITHUB_ENV
-            exit 0
-          fi
-
-          python3 -c "
-          import sys, json, os
-
-          data = json.loads('$BODY' if False else open('/dev/stdin').read())
-          text = data['content'][0]['text']
-
-          verdict = 'COMMENT'
-          if 'VERDICT: APPROVE' in text:
-              verdict = 'APPROVE'
-          elif 'VERDICT: REQUEST_CHANGES' in text:
-              verdict = 'REQUEST_CHANGES'
-
-          review = '\n'.join([l for l in text.split('\n') if not l.startswith('VERDICT:')])
-
-          with open(os.environ['GITHUB_ENV'], 'a') as f:
-              f.write(f'VERDICT={verdict}\n')
-              f.write('REVIEW<<EOF\n')
+          env_file = os.environ["GITHUB_ENV"]
+          with open(env_file, "a") as f:
+              f.write(f"VERDICT={verdict}\n")
+              f.write("REVIEW<<EOF\n")
               f.write(review.strip())
-              f.write('\nEOF\n')
-          " <<< "$BODY"
+              f.write("\nEOF\n")
 
-      - name: Dismiss stale review on new push
+          PYEOF
+
+      - name: Dismiss stale reviews on new push
         if: github.event.action == 'synchronize'
         uses: actions/github-script@v7
         with:
@@ -107,7 +104,6 @@ Odpowiedz po polsku.
               repo: context.repo.repo,
               pull_number: context.issue.number
             });
-
             for (const review of reviews.data) {
               if (review.state === 'CHANGES_REQUESTED') {
                 await github.rest.pulls.dismissReview({
@@ -115,7 +111,7 @@ Odpowiedz po polsku.
                   repo: context.repo.repo,
                   pull_number: context.issue.number,
                   review_id: review.id,
-                  message: 'Nowy commit – ponowna analiza.'
+                  message: 'Nowy commit - ponowna analiza.'
                 });
               }
             }
@@ -127,17 +123,12 @@ Odpowiedz po polsku.
           script: |
             const review = process.env.REVIEW;
             const verdict = process.env.VERDICT;
-
-            const emoji = {
-              'APPROVE': '✅',
-              'REQUEST_CHANGES': '❌',
-              'COMMENT': '💬'
-            };
+            const emoji = { APPROVE: '✅', REQUEST_CHANGES: '❌', COMMENT: '💬' };
 
             await github.rest.pulls.createReview({
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: context.issue.number,
               event: verdict,
-              body: `## ${emoji[verdict]} Claude Code Review\n\n${review}`
+              body: `## ${emoji[verdict] || '💬'} Claude Code Review\n\n${review}`
             });
